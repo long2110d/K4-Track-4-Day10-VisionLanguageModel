@@ -384,3 +384,210 @@ def per_image_f1(entries, preds):
     from scripts.score import evaluate
     return {e["image_id"]: evaluate([e], {e["image_id"]: preds.get(e["image_id"], "")}, n_boot=1)
             for e in entries}
+
+
+# ---------------------------------------------------------------- Chạy trọn một thí nghiệm (chạy lại được)
+REPORT = ROOT / "report"
+EXTRA = REPORT / "extra"
+WORK = ROOT / "work"
+
+
+def free():
+    import gc
+
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _save_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _train_once(name, setup, r, alpha, cfg, batch_size, grad_accum):
+    model, processor = load_model()
+    model, n_matched, _ = apply_setup(model, setup, r=r, alpha=alpha, dropout=cfg["lora"]["dropout"])
+    out = WORK / f"adapter_{name}"
+    run = train(model, processor, out, setup, lr=cfg["lr"], batch_size=batch_size,
+                grad_accum=grad_accum, max_steps=cfg["max_steps"], seed=cfg["seed"])
+    run.update({"lora_modules": n_matched, "r": r, "alpha": alpha})
+    (out / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+    return model, processor
+
+
+def run_experiment(name, setup, r=None, alpha=None):
+    """Train (nếu chưa có adapter) → suy luận test → chấm → report/evidence/<name>.json."""
+    import torch
+    import yaml
+    ev = REPORT / "evidence" / f"{name}.json"
+    if ev.exists():
+        print(f"{name}: đã có {ev}, bỏ qua")
+        return json.loads(ev.read_text(encoding="utf-8"))
+    cfg = yaml.safe_load((ROOT / "configs" / f"{setup.lower()}.yaml").read_text(encoding="utf-8"))
+    r = r or cfg["lora"]["r"]
+    alpha = alpha or cfg["lora"]["alpha"]
+    out = WORK / f"adapter_{name}"
+    if (out / "run.json").exists():
+        print(f"{name}: đã train xong, nạp lại adapter {out}")
+        model, processor = load_model(out)
+    else:
+        oom = False
+        try:
+            model, processor = _train_once(name, setup, r, alpha, cfg, cfg["batch_size"], cfg["grad_accum"])
+        except torch.cuda.OutOfMemoryError:
+            oom = True
+        if oom:   # GUIDE "Khi gặp sự cố": batch 1 × accum 8 (vẫn 8 ảnh mỗi bước tối ưu)
+            free()
+            print(f"{name}: hết VRAM với batch {cfg['batch_size']}, chạy lại với batch 1 × accum 8")
+            model, processor = _train_once(name, setup, r, alpha, cfg, 1,
+                                           cfg["batch_size"] * cfg["grad_accum"])
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    _save_json(EXTRA / "runs" / f"{name}.json", run)
+    if (out / "loss.json").exists():
+        _save_json(EXTRA / "loss" / f"{name}.json",
+                   json.loads((out / "loss.json").read_text(encoding="utf-8")))
+    pred = WORK / f"{name}.jsonl"
+    predict(model, processor, load_split("test"), pred)
+    del model, processor
+    free()
+    score(pred, name.upper(), ev, run_json=out / "run.json")
+    return json.loads(ev.read_text(encoding="utf-8"))
+
+
+def run_e0():
+    ev = REPORT / "evidence" / "e0.json"
+    if ev.exists():
+        print("e0: đã có, bỏ qua")
+        return
+    model, processor = load_model()
+    _save_json(EXTRA / "model_blocks.json", count_blocks(model))
+    check_example(processor, load_split("train")[0])
+    _save_json(EXTRA / "token_stats.json", token_stats(processor))
+    predict(model, processor, load_split("test"), WORK / "e0.jsonl")
+    del model, processor
+    free()
+    score(WORK / "e0.jsonl", "E0", ev)
+    from scripts.score import parse_output
+    rows = read_jsonl(WORK / "e0.jsonl")
+    bad = [r for r in rows if parse_output(r["raw"]) is None]
+    _save_json(EXTRA / "e0_samples.json", {"first": rows[:5], "invalid": bad[:5], "n_invalid": len(bad)})
+
+
+# ---------------------------------------------------------------- Số liệu phụ cho báo cáo
+def data_stats():
+    meta = json.loads((DATA / "splits" / "meta.json").read_text(encoding="utf-8"))
+    out = {"dataset_version": meta["dataset_version"], "counts": meta["counts"],
+           "n_sessions": {}, "median_area_pct": {}}
+    for s in ("train", "val", "test"):
+        out["n_sessions"][s] = len({r["session"] for r in load_split(s)})
+    for c in CLASSES:
+        areas = sorted(o["yolo"][2] * o["yolo"][3] * 100 for s in ("train", "val", "test")
+                       for r in load_split(s) for o in r["objects"] if o["label"] == c)
+        out["median_area_pct"][c] = round(areas[len(areas) // 2], 3)
+    _save_json(EXTRA / "data_stats.json", out)
+    return out
+
+
+def token_stats(processor, n=40):
+    """Trung bình số token ảnh / tổng / đáp án (phần được tính loss) trên n ảnh train."""
+    img_tok = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    rows = load_split("train")[:n]
+    s = {"image": 0, "total": 0, "answer": 0}
+    for e in rows:
+        enc = encode_example(processor, open_image(e), objects_to_answer(e["objects"]))
+        s["image"] += int((enc["input_ids"] == img_tok).sum())
+        s["total"] += enc["input_ids"].shape[1]
+        s["answer"] += int((enc["labels"] != -100).sum())
+    return {**{k: round(v / len(rows), 1) for k, v in s.items()}, "n": len(rows)}
+
+
+def coord_check(name):
+    """Chấm dự đoán 0–1000 như thể là pixel, và dự đoán đổi sang pixel chấm như thể là 0–1000."""
+    from scripts.score import evaluate, parse_output
+    entries = load_split("test")
+    preds = {r["image_id"]: r["raw"] for r in read_jsonl(WORK / f"{name}.jsonl")}
+    as_pixel = {}
+    for e in entries:
+        p = parse_output(preds.get(e["image_id"], "")) or []
+        as_pixel[e["image_id"]] = json.dumps([{"label": x["label"], "bbox_2d": [
+            round(v) for v in norm1000_to_pixel(x["bbox"], e["width"], e["height"])]} for x in p])
+    res = {
+        "correct": evaluate(entries, preds, n_boot=200)["micro"]["f1"],
+        "norm1000_scored_as_pixel": evaluate(entries, preds, coord="pixel", n_boot=200)["micro"]["f1"],
+        "pixel_scored_as_norm1000": evaluate(entries, as_pixel, n_boot=200)["micro"]["f1"],
+        "pixel_scored_as_pixel": evaluate(entries, as_pixel, coord="pixel", n_boot=200)["micro"]["f1"],
+    }
+    _save_json(EXTRA / "coord_check.json", {"name": name, **res})
+    print(res)
+    return res
+
+
+def best_setup():
+    f1 = {k: json.loads((REPORT / "evidence" / f"{k}.json").read_text(encoding="utf-8"))["micro"]["f1"]
+          for k in ("e1", "e2", "e3")}
+    best = max(f1, key=f1.get)
+    print("F1:", {k: round(v, 3) for k, v in f1.items()}, "→ tốt nhất:", best.upper())
+    return best.upper()
+
+
+def make_figures(name):
+    """6 ảnh đúng/sai, mỗi lớp 3 ảnh sai nhất, 3 ảnh E0; lưu vào report/figures/."""
+    entries = load_split("test")
+    preds = {r["image_id"]: r["raw"] for r in read_jsonl(WORK / f"{name}.jsonl")}
+    f1 = per_image_f1(entries, preds)
+    ranked = sorted((e for e in entries if e["objects"]), key=lambda e: f1[e["image_id"]]["micro"]["f1"])
+
+    def title(e, prefix=""):
+        return f"{prefix}{name.upper()} F1={f1[e['image_id']]['micro']['f1']:.2f} {e['image_id'][:30]}"
+
+    picks = ranked[-3:] + ranked[:3]
+    show_grid([draw_boxes(e, preds[e["image_id"]], title(e)) for e in picks],
+              path=REPORT / "figures" / f"{name}_good_bad.jpg")
+    for c in CLASSES:
+        bad = [e for e in ranked if any(o["label"] == c for o in e["objects"])][:3]
+        show_grid([draw_boxes(e, preds[e["image_id"]], title(e, f"{c}: ")) for e in bad],
+                  path=REPORT / "figures" / f"errors_{c}.jpg")
+    preds0 = {r["image_id"]: r["raw"] for r in read_jsonl(WORK / "e0.jsonl")}
+    show_grid([draw_boxes(e, preds0[e["image_id"]], f"E0 {e['image_id'][:40]}") for e in picks[:3]],
+              path=REPORT / "figures" / "e0_examples.jpg")
+
+
+def plot_losses():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    for p in sorted((EXTRA / "loss").glob("*.json")):
+        ys = [x["loss"] for x in json.loads(p.read_text(encoding="utf-8"))]
+        sm = [sum(ys[max(0, i - 9):i + 1]) / len(ys[max(0, i - 9):i + 1]) for i in range(len(ys))]
+        ax.plot(range(1, len(sm) + 1), sm, label=p.stem.upper())
+    ax.set_xlabel("bước tối ưu")
+    ax.set_ylabel("loss (trung bình trượt 10 bước)")
+    ax.legend()
+    fig.tight_layout()
+    (REPORT / "figures").mkdir(parents=True, exist_ok=True)
+    fig.savefig(REPORT / "figures" / "loss.png", dpi=110)
+
+
+# ---------------------------------------------------------------- Mang kết quả về máy local
+BUNDLE_BEGIN, BUNDLE_END = "=====LAB10-BUNDLE-BEGIN=====", "=====LAB10-BUNDLE-END====="
+
+
+def bundle_outputs():
+    """In report/ dạng zip base64 vào output của ô; `python extract_outputs.py` ở máy local giải ra."""
+    import base64
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(REPORT.rglob("*")):
+            if p.is_file():
+                z.write(p, p.relative_to(ROOT).as_posix())
+    data = base64.b64encode(buf.getvalue()).decode()
+    print(BUNDLE_BEGIN)
+    for i in range(0, len(data), 4000):
+        print(data[i:i + 4000])
+    print(BUNDLE_END)
+    print(f"{len(buf.getvalue()) / 1024:.0f} KB")
