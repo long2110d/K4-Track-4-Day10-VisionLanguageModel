@@ -105,7 +105,7 @@ from scripts.labcommon import CLASSES
 # Giữ các tên mà những ô phần 2–8 hiện tại sử dụng; các nhiệm vụ sau thay mã lõi.
 from lab10 import (
     draw_boxes,
-    bundle_outputs, LLM_TARGETS, VIT_TARGETS, PROJECTOR_KEYS, run_experiment,
+    bundle_outputs, LLM_TARGETS, VIT_TARGETS, PROJECTOR_KEYS,
     best_setup, coord_check, make_figures, plot_losses,
 )
 
@@ -420,24 +420,186 @@ def apply_setup(model, setup, r=16, alpha=32, dropout=0.05):
                if p.requires_grad and any(k in n for k in PROJECTOR_KEYS))
     print(f"tham số huấn luyện: {trainable:,} (trong đó projector {proj:,})")
     return model, len(matched), trainable'''),
-    md(r'''## 6. Vòng huấn luyện (mỗi setup ≈ 20–40 phút + ≈ 10 phút suy luận)'''),
-    code(r'''run_experiment('e1', 'E1')
-bundle_outputs()'''),
-    code(r'''run_experiment('e2', 'E2')
-bundle_outputs()'''),
-    code(r'''run_experiment('e3', 'E3')
-bundle_outputs()'''),
+    md(r'''## 6. Vòng huấn luyện'''),
+    code(r'''def train(model, processor, out_dir, setup, lr=2e-4, batch_size=2, grad_accum=4, max_steps=300,
+          seed=42, train_fraction=1.0, save_every=100, log_every=10):
+    import torch
+    import random
+    from transformers import get_cosine_schedule_with_warmup
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    entries = train_rows[:]
+    if train_fraction < 1.0:
+        entries = random.Random(seed).sample(entries, max(1, int(len(entries) * train_fraction)))
+    collate = make_collate(processor)
+    processor.tokenizer.padding_side = "right"
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    sched = get_cosine_schedule_with_warmup(opt, int(0.05 * max_steps), max_steps)
+    scaler = torch.amp.GradScaler("cuda")
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+    model.train()
+    torch.cuda.reset_peak_memory_stats()
+
+    rng = random.Random(seed)
+    order, pos = [], 0
+    log = []
+    t0 = time.time()
+    for step in range(1, max_steps + 1):
+        total = 0.0
+        for _ in range(grad_accum):
+            if pos + batch_size > len(order):
+                order, pos = entries[:], 0
+                rng.shuffle(order)
+            batch = collate(order[pos:pos + batch_size])
+            pos += batch_size
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            with torch.autocast("cuda", dtype=torch.float16):
+                loss = model(**batch).loss / grad_accum
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"loss không hữu hạn ở bước {step}: {loss.item()} (tràn fp16?)")
+            scaler.scale(loss).backward()
+            total += loss.item()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        sched.step()
+        log.append({"step": step, "loss": total, "lr": sched.get_last_lr()[0]})
+        if step % log_every == 0:
+            print(f"bước {step}/{max_steps} loss={total:.4f} lr={sched.get_last_lr()[0]:.2e} "
+                  f"{(time.time() - t0) / 60:.1f} phút")
+        if step % save_every == 0 or step == max_steps:
+            save_checkpoint(model, out_dir, setup)
+    run = {
+        "setup": setup,
+        "trainable_params": sum(p.numel() for p in params),
+        "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2),
+        "train_minutes": round((time.time() - t0) / 60, 1),
+        "max_steps": max_steps, "lr": lr, "batch_size": batch_size, "grad_accum": grad_accum,
+        "train_images": len(entries), "seed": seed, "train_fraction": train_fraction,
+        "save_every": save_every, "log_every": log_every,
+    }
+    (out_dir / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+    (out_dir / "loss.json").write_text(json.dumps(log), encoding="utf-8")
+    model.gradient_checkpointing_disable()
+    model.eval()
+    print(run)
+    return run
+
+
+def save_checkpoint(model, out_dir, setup):
+    import torch
+    model.save_pretrained(out_dir)                     # peft: CHỈ lưu adapter LoRA
+    if setup in ("E2", "E3"):                         # projector train đầy đủ phải lưu riêng
+        torch.save(projector_state(model), Path(out_dir) / "projector.pt")
+    print(f"  đã lưu checkpoint vào {out_dir}")
+
+
+def train_setup(name, setup, r=None, alpha=None):
+    evidence = Path(f'report/evidence/{name}.json')
+    out_dir = Path(f'work/adapter_{name}')
+    if evidence.exists() or (out_dir / 'run.json').exists():
+        print(f'{name}: đã có bằng chứng hoặc huấn luyện xong, bỏ qua.')
+        if (out_dir / 'run.json').exists():
+            for source, folder in (('run.json', 'runs'), ('loss.json', 'loss')):
+                target = Path('report/extra') / folder / f'{name}.json'
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(out_dir / source, target)
+        save_to_drive()
+        return
+    import torch
+    import yaml
+    from lab10 import free
+
+    cfg = yaml.safe_load(Path(f'configs/{setup.lower()}.yaml').read_text(encoding='utf-8'))
+    r = cfg['lora']['r'] if r is None else r
+    alpha = cfg['lora']['alpha'] if alpha is None else alpha
+    batch_size, grad_accum = cfg['batch_size'], cfg['grad_accum']
+    model = processor = None
+    try:
+        for attempt in range(2):
+            oom = False
+            try:
+                model, processor = load_model()
+                model, lora_modules, _ = apply_setup(
+                    model, setup, r=r, alpha=alpha, dropout=cfg['lora']['dropout'])
+                run = train(model, processor, out_dir, setup, lr=cfg['lr'],
+                            batch_size=batch_size, grad_accum=grad_accum,
+                            max_steps=cfg['max_steps'], seed=cfg['seed'])
+            except torch.cuda.OutOfMemoryError:
+                if attempt == 1:
+                    raise
+                oom = True
+            # Ra khỏi except để giải phóng traceback giữ tensor của lần lỗi.
+            if oom:
+                model = processor = None
+                free()
+                batch_size, grad_accum = 1, cfg['batch_size'] * cfg['grad_accum']
+                print(f'{name}: hết VRAM, thử lại với batch 1, tích luỹ {grad_accum}.')
+                continue
+            run.update({'lora_modules': lora_modules, 'r': r, 'alpha': alpha})
+            (out_dir / 'run.json').write_text(json.dumps(run, indent=2), encoding='utf-8')
+            for source, folder in (('run.json', 'runs'), ('loss.json', 'loss')):
+                target = Path('report/extra') / folder / f'{name}.json'
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(out_dir / source, target)
+            break
+    finally:
+        model = processor = None
+        free()
+    save_to_drive()'''),
+    code(r'''train_setup('e1', 'E1')'''),
+    code(r'''train_setup('e2', 'E2')'''),
+    code(r'''train_setup('e3', 'E3')'''),
     md(r'''## 7. Suy luận và chấm E1–E3'''),
-    code(r'''for k in ('e0', 'e1', 'e2', 'e3'):
-    d = json.load(open(f'report/evidence/{k}.json'))
+    code(r'''def evaluate_setup(name, coord='norm1000'):
+    evidence = Path(f'report/evidence/{name}.json')
+    if evidence.exists():
+        print(f'{name}: đã có {evidence}, bỏ qua suy luận và chấm.')
+        return
+    from lab10 import free
+
+    run = json.loads(Path(f'work/adapter_{name}/run.json').read_text(encoding='utf-8'))
+    model = processor = None
+    try:
+        model, processor = load_model(f'work/adapter_{name}')
+        predict(model, processor, test_rows, f'work/{name}.jsonl')
+    finally:
+        model = processor = None
+        free()
+    subprocess.run([
+        sys.executable, 'scripts/score.py', '--pred', f'work/{name}.jsonl',
+        '--name', name.upper(), '--out', f'report/evidence/{name}.json', '--coord', coord,
+        '--meta', f"trainable_params={run['trainable_params']}",
+        '--meta', f"peak_vram_gb={run['peak_vram_gb']}",
+        '--meta', f"train_minutes={run['train_minutes']}",
+    ], check=True)
+    save_to_drive()'''),
+    code(r'''for k in ('e1', 'e2', 'e3'):
+    evaluate_setup(k)
+
+print('Thí nghiệm | micro F1 | CI95 | parse_valid_rate | meta')
+results = {}
+for k in ('e0', 'e1', 'e2', 'e3'):
+    d = json.loads(Path(f'report/evidence/{k}.json').read_text(encoding='utf-8'))
+    results[k] = d
     print(k.upper(), 'F1=%.3f' % d['micro']['f1'], 'CI95=[%.3f, %.3f]' % tuple(d['f1_ci95']),
           'valid=%.3f' % d['parse_valid_rate'], 'meta=', d['meta'])
-BEST = best_setup()
-coord_check(BEST.lower())     # Câu 3: chấm sai thang toạ độ'''),
+BEST = max(('e1', 'e2', 'e3'), key=lambda k: results[k]['micro']['f1']).upper()
+coord_check(BEST.lower())     # Câu 3: chấm sai thang toạ độ
+save_to_drive()'''),
     md(r'''## 8. E4 (ablation tự chọn) và E5 (tuỳ chọn, GRPO)
 E4: đổi **rank LoRA** trên setup tốt nhất của E1–E3, r = 4 và r = 64 (alpha = 2r). E5: không làm.'''),
     code(r'''for r in (4, 64):
-    run_experiment(f'e4_rank_{r}', BEST, r=r, alpha=2 * r)
+    train_setup(f'e4_rank_{r}', BEST, r=r, alpha=2 * r)
+    evaluate_setup(f'e4_rank_{r}')
     bundle_outputs()'''),
     code(r'''make_figures(BEST.lower())
 plot_losses()

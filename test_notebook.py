@@ -54,14 +54,14 @@ def all_code():
     return "\n\n".join(strip_magics(cell["source"]) for cell in cells("code"))
 
 
-def test_core_defs_match_lab10_signatures():
+def assert_signatures_match_lab10(names):
     import ast
     import inspect
     import lab10
 
     definitions = {node.name: node for node in ast.parse(all_code()).body
                    if isinstance(node, ast.FunctionDef)}
-    for name in ('encode_example', 'make_collate', 'check_example', 'apply_setup'):
+    for name in names:
         args = definitions[name].args
         positional = args.posonlyargs + args.args
         defaults = [inspect.Parameter.empty] * (len(positional) - len(args.defaults))
@@ -79,6 +79,58 @@ def test_core_defs_match_lab10_signatures():
         if args.kwarg:
             parameters.append(inspect.Parameter(args.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
         assert inspect.Signature(parameters) == inspect.signature(getattr(lab10, name))
+
+
+def test_core_defs_match_lab10_signatures():
+    assert_signatures_match_lab10(('encode_example', 'make_collate', 'check_example', 'apply_setup'))
+
+
+def test_train_defs_match_lab10_signatures():
+    assert_signatures_match_lab10(('train', 'save_checkpoint', 'predict'))
+
+
+def test_training_guide_details():
+    import ast
+
+    source = section_code(6)
+    for token in ('GradScaler', 'get_cosine_schedule_with_warmup', 'use_reentrant',
+                  'clip_grad_norm_', 'projector.pt', 'run.json', 'OutOfMemoryError', 'configs/'):
+        assert token in source
+    calls = [node for node in ast.parse(source).body if isinstance(node, ast.Expr)
+             and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+             and node.value.func.id == 'train_setup']
+    assert [ast.literal_eval(node.value.args[0]) for node in calls] == ['e1', 'e2', 'e3']
+
+
+def test_scoring_uses_meta_and_resume():
+    source = section_code(7)
+    for token in ('scripts/score.py', '--meta', 'trainable_params', 'peak_vram_gb',
+                  'train_minutes', 'report/evidence/', 'evaluate_setup(k)', 'check=True'):
+        assert token in source
+
+
+def test_no_one_line_lab10_runners():
+    source = NB.read_text(encoding='utf-8')
+    assert 'run_experiment(' not in source
+    assert 'run_e0(' not in source
+
+
+def test_evidence_skips_training_and_scoring(tmp_path, monkeypatch):
+    import ast
+
+    monkeypatch.chdir(tmp_path)
+    evidence = Path('report/evidence')
+    evidence.mkdir(parents=True)
+    (evidence / 'e1.json').write_text('{}', encoding='utf-8')
+    # Execute only the definitions: the guards must return before heavy imports or loading.
+    namespace = {'Path': Path, 'save_to_drive': lambda: None}
+    for section, name in ((6, 'train_setup'), (7, 'evaluate_setup')):
+        node = next(node for node in ast.parse(section_code(section)).body
+                    if isinstance(node, ast.FunctionDef) and node.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<resume>', 'exec'), namespace)
+    for _ in range(2):
+        namespace['train_setup']('e1', 'E1')
+        namespace['evaluate_setup']('e1')
 
 
 def test_target_constants_match_lab10():

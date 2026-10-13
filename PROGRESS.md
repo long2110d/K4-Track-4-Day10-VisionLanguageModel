@@ -26,3 +26,11 @@
 - Implemented inline LoRA targets and freeze/projector setup in section 5, with GUIDE parameter-count notes.
 - Regenerated lab_day10.ipynb and added offline signature, target-regex, and mask-check tests.
 - Validation: python -m pytest -q completed with 88 passed and 1 skipped.
+
+## Task 5: Sections 6–7, training loop with resume, then inference and scoring of E1–E3
+- Added inline mixed-precision training and adapter/projector checkpoint saving in section 6.
+- Added resumable E1–E3 training with one OOM retry, run/loss exports, and Drive saving.
+- Added adapter inference, scoring metadata, the E0–E3 results table, and best-setup coordinate checks.
+- Replaced the existing E4 runner call with the shared training/evaluation functions to satisfy the no-runner check.
+- Regenerated the notebook and added offline signature, training, scoring, and resume tests.
+- Validation: python -m pytest -q passed with 93 passed and 1 skipped.
