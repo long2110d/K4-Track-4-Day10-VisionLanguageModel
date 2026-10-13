@@ -12,3 +12,7 @@ adapter*/
 .ipynb_checkpoints/
 .pytest_cache/
 .DS_Store
+.auto-logs/
+REVIEW.md
+TASK_SUMMARY.md
+.autowf.env
