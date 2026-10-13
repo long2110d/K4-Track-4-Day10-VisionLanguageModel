@@ -54,6 +54,59 @@ def all_code():
     return "\n\n".join(strip_magics(cell["source"]) for cell in cells("code"))
 
 
+def test_core_defs_match_lab10_signatures():
+    import ast
+    import inspect
+    import lab10
+
+    definitions = {node.name: node for node in ast.parse(all_code()).body
+                   if isinstance(node, ast.FunctionDef)}
+    for name in ('encode_example', 'make_collate', 'check_example', 'apply_setup'):
+        args = definitions[name].args
+        positional = args.posonlyargs + args.args
+        defaults = [inspect.Parameter.empty] * (len(positional) - len(args.defaults))
+        defaults += [ast.literal_eval(value) for value in args.defaults]
+        parameters = [inspect.Parameter(
+            arg.arg, inspect.Parameter.POSITIONAL_ONLY if i < len(args.posonlyargs)
+            else inspect.Parameter.POSITIONAL_OR_KEYWORD, default=default)
+            for i, (arg, default) in enumerate(zip(positional, defaults))]
+        if args.vararg:
+            parameters.append(inspect.Parameter(args.vararg.arg, inspect.Parameter.VAR_POSITIONAL))
+        parameters.extend(inspect.Parameter(
+            arg.arg, inspect.Parameter.KEYWORD_ONLY,
+            default=inspect.Parameter.empty if default is None else ast.literal_eval(default))
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults))
+        if args.kwarg:
+            parameters.append(inspect.Parameter(args.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
+        assert inspect.Signature(parameters) == inspect.signature(getattr(lab10, name))
+
+
+def test_target_constants_match_lab10():
+    import ast
+    import re
+    import lab10
+
+    names = {'LLM_TARGETS', 'VIT_TARGETS', 'PROJECTOR_KEYS'}
+    nodes = [node for node in ast.parse(section_code(5)).body
+             if isinstance(node, ast.Assign) and any(
+                 isinstance(target, ast.Name) and target.id in names for target in node.targets)]
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<targets>', 'exec'), namespace)
+    for name in names:
+        assert namespace[name] == getattr(lab10, name)
+    for module in ('model.language_model.layers.3.mlp.down_proj',
+                   'model.language_model.layers.0.self_attn.q_proj'):
+        assert re.fullmatch(namespace['LLM_TARGETS'], module)
+    assert not re.fullmatch(namespace['LLM_TARGETS'], 'model.visual.blocks.0.attn.qkv')
+    assert re.fullmatch(namespace['VIT_TARGETS'], 'model.visual.blocks.5.mlp.linear_fc1')
+
+
+def test_mask_loss_checks_present():
+    source = section_code(4)
+    for token in ('-100', '220', '<|im_end|>'):
+        assert token in source
+
+
 def test_notebook_is_valid_json():
     nb = load_nb()
     assert nb["nbformat"] == 4

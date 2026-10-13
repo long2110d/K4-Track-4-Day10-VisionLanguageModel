@@ -315,15 +315,111 @@ with open('report/evidence/e0.json', encoding='utf-8') as file:
 print('parse_valid_rate:', evidence['parse_valid_rate'])
 save_to_drive()'''),
     md(r'''## 4. Dựng dữ liệu huấn luyện: chat template và mask loss
-`encode_example` (trong `lab10.py`) đã chạy ở ô E0 (`check_example`): token ảnh phải là **220**, phần `labels != -100` giải mã ra đúng JSON + `<|im_end|>`.'''),
-    code(r'''tok = json.load(open('report/extra/token_stats.json'))
-print(tok)
-assert tok['image'] == 220, tok'''),
+Chỉ tính loss trên JSON đáp án và `<|im_end|>`; bỏ qua prompt và token padding bằng nhãn -100.'''),
+    code(r'''def encode_example(processor, image, answer):
+    import torch
+    user = user_message(image)
+    assistant = {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+    kw = dict(tokenize=True, return_dict=True, return_tensors="pt")
+    prompt_enc = processor.apply_chat_template([user], add_generation_prompt=True, **kw)
+    full_enc = processor.apply_chat_template([user, assistant], add_generation_prompt=False, **kw)
+    n = prompt_enc["input_ids"].shape[1]
+    assert torch.equal(full_enc["input_ids"][0, :n], prompt_enc["input_ids"][0]), \
+        "prompt không phải tiền tố của chuỗi đầy đủ"
+    # cắt phần sau <|im_end|> cuối (dấu xuống dòng) để đáp án kết thúc đúng bằng <|im_end|>
+    end_id = processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+    ids = full_enc["input_ids"][0].tolist()
+    last = len(ids) - 1 - ids[::-1].index(end_id)
+    enc = {k: (v[:, :last + 1] if k in ("input_ids", "attention_mask", "mm_token_type_ids",
+                                        "token_type_ids") else v)
+           for k, v in full_enc.items()}
+    labels = enc["input_ids"].clone()
+    labels[:, :n] = -100
+    enc["labels"] = labels
+    return enc
+
+
+def make_collate(processor):
+    import torch
+    pad_id = processor.tokenizer.pad_token_id
+
+    def collate(entries):
+        encs = [encode_example(processor, open_image(e), objects_to_answer(e["objects"]))
+                for e in entries]
+        L = max(x["input_ids"].shape[1] for x in encs)
+        batch = {}
+        for k in encs[0]:
+            if k in ("pixel_values", "image_grid_thw"):
+                batch[k] = torch.cat([x[k] for x in encs], dim=0)   # không pad
+                continue
+            fill = {"input_ids": pad_id, "labels": -100}.get(k, 0)
+            batch[k] = torch.cat([torch.nn.functional.pad(x[k], (0, L - x[k].shape[1]), value=fill)
+                                  for x in encs], dim=0)
+        return batch
+    return collate
+
+
+def check_example(processor, entry):
+    """In số token ảnh và phần đáp án (labels != -100) đã giải mã."""
+    enc = encode_example(processor, open_image(entry), objects_to_answer(entry["objects"]))
+    img_tok = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    n_img = int((enc["input_ids"] == img_tok).sum())
+    ans = processor.tokenizer.decode(enc["input_ids"][enc["labels"] != -100])
+    print("token ảnh:", n_img, "| tổng token:", enc["input_ids"].shape[1])
+    print("phần được tính loss:", ans)
+    return n_img, ans'''),
+    code(r'''from lab10 import token_stats
+
+# Chỉ nạp processor nếu E0 đã được bỏ qua hoặc đã giải phóng bộ nhớ.
+if 'processor' not in globals():
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+n_img, ans = check_example(processor, train_rows[0])
+assert n_img == 220, n_img
+assert ans.endswith('<|im_end|>'), ans
+assert ans[:-len('<|im_end|>')] == objects_to_answer(train_rows[0]['objects']), ans
+tok = token_stats(processor)
+Path('report/extra').mkdir(parents=True, exist_ok=True)
+Path('report/extra/token_stats.json').write_text(
+    json.dumps(tok, ensure_ascii=False, indent=2), encoding='utf-8')
+print(tok)'''),
     md(r'''## 5. Setup LoRA / đóng băng cho E1, E2, E3
-`apply_setup`: E1 LoRA trên 252 module LLM; E2 + projector fp32 train đầy đủ; E3 + LoRA trên 96 module ViT (tổng 348).'''),
-    code(r'''print('LLM :', LLM_TARGETS)
-print('ViT :', VIT_TARGETS)
-print('projector:', PROJECTOR_KEYS)'''),
+Theo GUIDE: E1/E2 có 252 module LLM; E3 thêm 96 module ViT, tổng 348.
+E2 − E1 ≈ 109M tham số do huấn luyện thêm projector ở fp32.'''),
+    code(r'''PROJECTOR_KEYS = ("visual.merger", "visual.deepstack_merger_list")
+LLM_TARGETS = r".*language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+VIT_TARGETS = r".*visual\.blocks\.\d+\.(attn\.(qkv|proj)|mlp\.linear_fc[12])"
+
+
+def apply_setup(model, setup, r=16, alpha=32, dropout=0.05):
+    """setup: "E1" (LoRA LLM), "E2" (+ projector), "E3" (+ LoRA ViT)."""
+    import re
+
+    import torch
+    from peft import LoraConfig, get_peft_model
+
+    for p in model.parameters():
+        p.requires_grad = False
+    model.enable_input_require_grads()
+    target = LLM_TARGETS if setup == "E1" or setup == "E2" else f"({LLM_TARGETS})|({VIT_TARGETS})"
+    matched = [n for n, _ in model.named_modules() if re.fullmatch(target, n)]
+    print(f"{setup}: {len(matched)} module LoRA (mong đợi {252 if setup != 'E3' else 348})")
+    model = get_peft_model(model, LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout,
+                                             target_modules=target, task_type="CAUSAL_LM"))
+    if setup in ("E2", "E3"):
+        for n, p in model.named_parameters():
+            if any(k in n for k in PROJECTOR_KEYS):
+                p.data = p.data.float()
+                p.requires_grad = True
+    for p in model.parameters():          # GradScaler cần gradient fp32
+        if p.requires_grad and p.dtype != torch.float32:
+            p.data = p.data.float()
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    proj = sum(p.numel() for n, p in model.named_parameters()
+               if p.requires_grad and any(k in n for k in PROJECTOR_KEYS))
+    print(f"tham số huấn luyện: {trainable:,} (trong đó projector {proj:,})")
+    return model, len(matched), trainable'''),
     md(r'''## 6. Vòng huấn luyện (mỗi setup ≈ 20–40 phút + ≈ 10 phút suy luận)'''),
     code(r'''run_experiment('e1', 'E1')
 bundle_outputs()'''),
