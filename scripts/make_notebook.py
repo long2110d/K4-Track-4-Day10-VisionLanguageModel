@@ -104,7 +104,7 @@ from IPython.display import display
 from scripts.labcommon import CLASSES
 # Giữ các tên mà những ô phần 2–8 hiện tại sử dụng; các nhiệm vụ sau thay mã lõi.
 from lab10 import (
-    objects_to_answer, norm1000_to_pixel, PROMPT, draw_boxes, run_e0,
+    draw_boxes,
     bundle_outputs, LLM_TARGETS, VIT_TARGETS, PROJECTOR_KEYS, run_experiment,
     best_setup, coord_check, make_figures, plot_losses,
 )
@@ -145,24 +145,175 @@ Path('report/figures').mkdir(parents=True, exist_ok=True)
 grid.save('report/figures/train_samples.jpg', quality=90)
 display(grid)'''),
     md(r'''## 2. Nhãn: YOLO → JSON thang 0–1000'''),
-    code(r'''from scripts.score import _gt_boxes
-e = next(r for r in train_rows if len(r['objects']) >= 2)
-ans = objects_to_answer(e['objects'])
-print(ans)
-# quy ngược về pixel và đối chiếu với nhãn YOLO gốc (sai số chỉ do làm tròn)
-gt = sorted((g['bbox'] for g in _gt_boxes(e)), key=lambda b: (round(b[1]), round(b[0])))
-for b, g in zip(json.loads(ans), gt):
-    print(b['label'], [round(v, 1) for v in norm1000_to_pixel(b['bbox_2d'], 640, 360)],
-          [round(v, 1) for v in norm1000_to_pixel(g, 640, 360)])
-print(PROMPT)
-draw_boxes(e, raw=ans, title='xanh = GT, do = JSON da quy doi')'''),
+    code(r'''import json
+
+PROMPT = (
+    "You are inspecting a dashcam road image for damage. "
+    "Detect every pothole, crack and manhole. "
+    "Answer with ONLY a JSON list, no other text, in the form "
+    '[{"label": "pothole", "bbox_2d": [x1, y1, x2, y2]}]. '
+    "label must be one of: pothole, crack, manhole. "
+    "bbox_2d are integers on a 0-1000 scale relative to the image width and height "
+    "(0,0 is the top-left corner, 1000,1000 the bottom-right). "
+    "If there is no damage, answer []."
+)
+
+
+def yolo_to_box(label, yolo):
+    xc, yc, w, h = yolo
+    box = [(xc - w / 2) * 1000, (yc - h / 2) * 1000, (xc + w / 2) * 1000, (yc + h / 2) * 1000]
+    return {"label": label, "bbox_2d": [min(1000, max(0, round(v))) for v in box]}
+
+
+def objects_to_answer(objects):
+    boxes = [yolo_to_box(o["label"], o["yolo"]) for o in objects]
+    boxes.sort(key=lambda b: (b["bbox_2d"][1], b["bbox_2d"][0]))
+    return json.dumps(boxes, separators=(",", ":"))
+
+
+def norm1000_to_pixel(bbox, width, height):
+    x1, y1, x2, y2 = bbox
+    return [x1 / 1000 * width, y1 / 1000 * height, x2 / 1000 * width, y2 / 1000 * height]
+
+# Kiểm tra vòng chuyển đổi sau các định nghĩa độc lập.
+def check_label_roundtrip(rows):
+    from PIL import Image
+    from IPython.display import display
+    from lab10 import draw_boxes
+
+    entry = next(row for row in rows if len(row['objects']) >= 2)
+    answer = objects_to_answer(entry['objects'])
+    print(answer)
+    with Image.open('data/' + entry['image_path']) as image:
+        width, height = image.size
+    objects = sorted(entry['objects'], key=lambda obj: (
+        yolo_to_box(obj['label'], obj['yolo'])['bbox_2d'][1],
+        yolo_to_box(obj['label'], obj['yolo'])['bbox_2d'][0]))
+    errors = []
+    for box, obj in zip(json.loads(answer), objects):
+        xc, yc, w, h = obj['yolo']
+        direct = [max(0, min(width, (xc - w / 2) * width)),
+                  max(0, min(height, (yc - h / 2) * height)),
+                  max(0, min(width, (xc + w / 2) * width)),
+                  max(0, min(height, (yc + h / 2) * height))]
+        pixels = norm1000_to_pixel(box['bbox_2d'], width, height)
+        errors.extend(abs(a - b) for a, b in zip(pixels, direct))
+    assert max(errors) <= 1, f'Sai số quy đổi vượt 1 pixel: {max(errors)}'
+    print('Sai số lớn nhất (pixel):', max(errors))
+    display(draw_boxes(entry, raw=answer, title='xanh = GT, do = JSON da quy doi'))
+
+check_label_roundtrip(train_rows)'''),
     md(r'''## 3. E0: zero-shot'''),
-    code(r'''# nạp model 4-bit (ViT + lm_head fp16), đếm tham số từng khối, kiểm tra mask loss, suy luận test, chấm
-run_e0()
-print(json.load(open('report/extra/model_blocks.json')))
-for r in json.load(open('report/extra/e0_samples.json'))['first']:
-    print(repr(r['raw'][:300]))
-bundle_outputs()'''),
+    code(r'''import json
+import os
+import time
+from pathlib import Path
+from scripts.labcommon import read_jsonl
+
+MODEL_ID = 'Qwen/Qwen3-VL-4B-Instruct'
+PROJECTOR_KEYS = ('visual.merger', 'visual.deepstack_merger_list')
+
+def user_message(image):
+    return {"role": "user", "content": [{"type": "image", "image": image},
+                                        {"type": "text", "text": PROMPT}]}
+
+
+def open_image(entry):
+    from PIL import Image
+    return Image.open(Path("data") / entry["image_path"]).convert("RGB")
+
+
+def load_model(adapter_dir=None, model_id=MODEL_ID):
+    """Model 4-bit NF4 (ViT + lm_head giữ fp16). Có adapter_dir thì nạp LoRA và projector.pt nếu có."""
+    import torch
+    from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
+
+    quant = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True, llm_int8_skip_modules=["visual", "lm_head"])
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_id, quantization_config=quant, dtype=torch.float16, device_map={"": 0})
+    processor = AutoProcessor.from_pretrained(model_id)
+    processor.tokenizer.padding_side = "left"
+    if adapter_dir:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, adapter_dir)
+        proj = Path(adapter_dir) / "projector.pt"
+        if proj.exists():
+            load_projector(model, proj)
+    model.eval()
+    return model, processor
+
+
+def load_projector(model, path):
+    import torch
+    state = torch.load(path, map_location="cpu")
+    params = dict(model.named_parameters())
+    missing = [k for k in state if k not in params]
+    assert not missing, f"projector.pt có tham số không khớp model: {missing[:3]}"
+    with torch.no_grad():
+        for k, v in state.items():
+            params[k].copy_(v.to(params[k].dtype))
+    print(f"đã nạp lại {len(state)} tensor projector từ {path}")
+
+
+def projector_state(model):
+    return {n: p.detach().cpu().clone() for n, p in model.named_parameters()
+            if p.requires_grad and any(k in n for k in PROJECTOR_KEYS)}
+
+
+def predict(model, processor, entries, out_path, batch_size=4, max_new_tokens=256):
+    """Suy luận greedy, ghi {"image_id","raw"} mỗi dòng. Bỏ qua ảnh đã có trong out_path (chạy tiếp được)."""
+    import torch
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    done = {r["image_id"] for r in read_jsonl(out_path)} if out_path.exists() else set()
+    todo = [e for e in entries if e["image_id"] not in done]
+    processor.tokenizer.padding_side = "left"
+    model.eval()
+    model.config.use_cache = True
+    t0 = time.time()
+    with open(out_path, "a", encoding="utf-8") as f:
+        for i in range(0, len(todo), batch_size):
+            chunk = todo[i:i + batch_size]
+            inputs = processor.apply_chat_template(
+                [[user_message(open_image(e))] for e in chunk], tokenize=True,
+                add_generation_prompt=True, return_dict=True, return_tensors="pt", padding=True,
+            ).to(model.device)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            raws = processor.batch_decode(out[:, inputs["input_ids"].shape[1]:],
+                                          skip_special_tokens=True)
+            for e, raw in zip(chunk, raws):
+                f.write(json.dumps({"image_id": e["image_id"], "raw": raw}, ensure_ascii=False) + "\n")
+            f.flush()
+            if (i // batch_size) % 10 == 0:
+                print(f"  {i + len(chunk)}/{len(todo)} ảnh, {time.time() - t0:.0f}s")
+    print(f"xong {out_path} ({len(done) + len(todo)} dòng)")'''),
+    code(r'''import gc
+from lab10 import count_blocks
+
+if os.path.exists('report/evidence/e0.json'):
+    print('E0: đã có report/evidence/e0.json, bỏ qua.')
+else:
+    import torch
+    model, processor = load_model()
+    Path('report/extra').mkdir(parents=True, exist_ok=True)
+    Path('report/extra/model_blocks.json').write_text(
+        json.dumps(count_blocks(model), ensure_ascii=False, indent=2), encoding='utf-8')
+    predict(model, processor, test_rows, 'work/e0.jsonl')
+    del model, processor
+    gc.collect()
+    torch.cuda.empty_cache()'''),
+    code(r'''# Chấm riêng để có thể chạy tiếp nếu suy luận đã hoàn tất.
+if not os.path.exists('report/evidence/e0.json'):
+    !python scripts/score.py --pred work/e0.jsonl --name E0 --out report/evidence/e0.json
+for row in read_jsonl('work/e0.jsonl')[:5]:
+    print(row['raw'])
+with open('report/evidence/e0.json', encoding='utf-8') as file:
+    evidence = json.load(file)
+print('parse_valid_rate:', evidence['parse_valid_rate'])
+save_to_drive()'''),
     md(r'''## 4. Dựng dữ liệu huấn luyện: chat template và mask loss
 `encode_example` (trong `lab10.py`) đã chạy ở ô E0 (`check_example`): token ảnh phải là **220**, phần `labels != -100` giải mã ra đúng JSON + `<|im_end|>`.'''),
     code(r'''tok = json.load(open('report/extra/token_stats.json'))

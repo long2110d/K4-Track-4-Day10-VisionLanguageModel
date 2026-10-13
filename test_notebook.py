@@ -130,3 +130,83 @@ def test_generator_check_detects_drift_without_writing(tmp_path):
     assert result.returncode == 1
     assert "git diff" in result.stdout
     assert notebook.read_text(encoding="utf-8") == "{}"
+
+
+def test_label_functions_match_lab10():
+    import ast
+    import lab10
+
+    tree = ast.parse(strip_magics(section_code(2)))
+    names = {'yolo_to_box', 'objects_to_answer', 'norm1000_to_pixel'}
+    nodes = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
+             or isinstance(node, ast.FunctionDef) and node.name in names
+             or isinstance(node, ast.Assign) and any(
+                 isinstance(target, ast.Name) and target.id == 'PROMPT' for target in node.targets)]
+    ns = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<labels>', 'exec'), ns)
+    assert ns['PROMPT'] == lab10.PROMPT
+    fixtures = [
+        [{'label': 'crack', 'yolo': [0.5, 0.5, 0.2, 0.1]}],
+        [{'label': 'pothole', 'yolo': [0.01, 0.99, 0.1, 0.1]}],
+        [],
+        [{'label': 'manhole', 'yolo': [0.5, 0.5, 1, 1]}],
+        [{'label': 'crack', 'yolo': [0.8, 0.6, 0.1, 0.1]},
+         {'label': 'manhole', 'yolo': [0.2, 0.6, 0.1, 0.1]},
+         {'label': 'pothole', 'yolo': [0.5, 0.2, 0.1, 0.1]}],
+        [{'label': 'crack', 'yolo': [0.3005, 0.4005, 0.05, 0.02]},
+         {'label': 'manhole', 'yolo': [0.7, 0.8, 0.1, 0.08]}],
+    ]
+    for objects in fixtures:
+        assert ns['objects_to_answer'](objects) == lab10.objects_to_answer(objects)
+        for obj in objects:
+            box = ns['yolo_to_box'](obj['label'], obj['yolo'])
+            assert box == lab10.yolo_to_box(obj['label'], obj['yolo'])
+            for width, height in ((640, 360), (1280, 720), (1920, 1080)):
+                assert ns['norm1000_to_pixel'](box['bbox_2d'], width, height) == (
+                    lab10.norm1000_to_pixel(box['bbox_2d'], width, height))
+
+
+def test_load_model_uses_pinned_api():
+    import ast
+    import inspect
+    import lab10
+
+    source = strip_magics(section_code(3))
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'load_model')
+    assert [arg.arg for arg in function.args.args] == list(inspect.signature(lab10.load_model).parameters)
+    body = ast.get_source_segment(source, function)
+    for token in ('Qwen3VLForConditionalGeneration', 'BitsAndBytesConfig', '"nf4"',
+                  'dtype=torch.float16'):
+        assert token in body
+    assert 'torch_dtype' not in body
+    for code in (body, inspect.getsource(lab10.load_model)):
+        keywords = [node for node in ast.walk(ast.parse(code))
+                    if isinstance(node, ast.keyword) and node.arg == 'llm_int8_skip_modules']
+        assert len(keywords) == 1
+        assert isinstance(keywords[0].value, ast.List)
+        assert ast.literal_eval(keywords[0].value) == ['visual', 'lm_head']
+
+
+def test_e0_is_resumable():
+    import ast
+    import inspect
+    import lab10
+
+    source = strip_magics(section_code(3))
+    for token in ('report/evidence/e0.json', 'work/e0.jsonl', 'scripts/score.py'):
+        assert token in section_code(3)
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'predict')
+    assert [arg.arg for arg in function.args.args] == list(inspect.signature(lab10.predict).parameters)
+    assert 'run_e0(' not in source
+    # The evidence guard must enclose model loading.
+    tree = ast.parse(source)
+    guard = next(node for node in tree.body if isinstance(node, ast.If)
+                 and 'report/evidence/e0.json' in ast.get_source_segment(source, node.test))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == 'load_model' for node in ast.walk(ast.Module(body=guard.orelse, type_ignores=[])))
+    prediction = ast.get_source_segment(source, function)
+    assert 'if e["image_id"] not in done' in prediction
+    assert 'do_sample=False' in prediction
+    assert 'out[:, inputs["input_ids"].shape[1]:]' in prediction

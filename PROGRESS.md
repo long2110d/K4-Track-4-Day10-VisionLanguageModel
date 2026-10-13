@@ -12,3 +12,10 @@
 - Added resumable data preparation, inline split statistics, session checks, and a six-image YOLO preview.
 - Preserved sections 2-8 verbatim and added offline notebook regression tests.
 - Verified generator synchronization and python -m pytest -q: 82 passed, 1 skipped.
+
+## Task 3: Section 2 labels and section 3 E0 zero-shot written inline
+﻿- Implemented inline section 2 label helpers and the exact reference prompt.
+- Added a YOLO-to-JSON round-trip check with a one-pixel assertion and box visualization.
+- Implemented inline model loading, projector restoration, and resumable batched greedy prediction in section 3.
+- Added guarded E0 inference and scoring, raw output inspection, GPU cleanup, and Drive saving.
+- Regenerated the notebook and added offline parity, pinned API, and resume checks; pytest passed with 85 passed and 1 skipped.
