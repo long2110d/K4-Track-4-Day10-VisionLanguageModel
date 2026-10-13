@@ -596,15 +596,17 @@ BEST = max(('e1', 'e2', 'e3'), key=lambda k: results[k]['micro']['f1']).upper()
 coord_check(BEST.lower())     # Câu 3: chấm sai thang toạ độ
 save_to_drive()'''),
     md(r'''## 8. E4 (ablation tự chọn) và E5 (tuỳ chọn, GRPO)
-E4: đổi **rank LoRA** trên setup tốt nhất của E1–E3, r = 4 và r = 64 (alpha = 2r). E5: không làm.'''),
+E4: đổi **rank LoRA** trên setup tốt nhất của E1–E3, r = 4 và r = 64 (alpha = 2r), theo lựa chọn `rank` trong `configs/e4.yaml`; giữ nguyên mọi thiết lập khác. E5: không làm.'''),
     code(r'''for r in (4, 64):
-    train_setup(f'e4_rank_{r}', BEST, r=r, alpha=2 * r)
-    evaluate_setup(f'e4_rank_{r}')
-    bundle_outputs()'''),
+    name = f'e4_rank_{r}'
+    train_setup(name, BEST, r=r, alpha=2 * r)
+    evaluate_setup(name)'''),
     code(r'''make_figures(BEST.lower())
 plot_losses()
 !python scripts/check_submission.py
-bundle_outputs()   # gói cuối cùng: evidence + figures + extra'''),
+save_to_drive()
+bundle_outputs()   # gói cuối cùng: evidence + figures + extra
+# Chạy python extract_outputs.py trên máy local để giải nén gói kết quả.'''),
 ]
 
 

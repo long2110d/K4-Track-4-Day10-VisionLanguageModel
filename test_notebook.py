@@ -1,6 +1,8 @@
 """Offline structural checks and shared helpers for the lab notebook."""
 
 import json
+import ast
+import builtins
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +54,68 @@ def strip_magics(src):
 
 def all_code():
     return "\n\n".join(strip_magics(cell["source"]) for cell in cells("code"))
+
+
+def test_no_placeholders():
+    for cell in load_nb()['cells']:
+        assert 'YOUR CODE HERE' not in ''.join(cell['source'])
+
+
+def test_lab10_imports_exist():
+    import lab10
+
+    tree = ast.parse(all_code())
+    core = {'yolo_to_box', 'objects_to_answer', 'load_model', 'predict',
+            'encode_example', 'make_collate', 'apply_setup', 'train', 'save_checkpoint'}
+    definitions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert core <= definitions
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == 'lab10':
+            for alias in node.names:
+                assert alias.name != '*'
+                assert hasattr(lab10, alias.name), alias.name
+                assert alias.name not in core
+                assert (alias.asname or alias.name) not in core
+        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+              and node.value.id == 'lab10'):
+            assert hasattr(lab10, node.attr), node.attr
+
+
+def test_notebook_called_functions_are_known():
+    tree = ast.parse(all_code())
+    known = set(dir(builtins)) | {'display', 'get_ipython'}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            known.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            known.add(node.id)
+        elif isinstance(node, ast.arg):
+            known.add(node.arg)
+        elif isinstance(node, ast.Import):
+            known.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            known.update(alias.asname or alias.name for alias in node.names)
+    calls = {node.func.id for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    assert not calls - known, f'Unknown notebook calls: {sorted(calls - known)}'
+
+
+def test_e4_rank_ablation():
+    source = section_code(8)
+    for token in ('e4_rank_', '(4, 64)', 'check_submission.py'):
+        assert token in source
+    assert '2 * r' in source or '2*r' in source
+    tree = ast.parse(strip_magics(source))
+    loop = next(node for node in tree.body if isinstance(node, ast.For))
+    assert ast.literal_eval(loop.iter) == (4, 64)
+    calls = [node.value for node in loop.body if isinstance(node, ast.Expr)]
+    assert [call.func.id for call in calls] == ['train_setup', 'evaluate_setup']
+    assert [ast.unparse(arg) for arg in calls[0].args] == ['name', 'BEST']
+    assert {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords} == {
+        'r': 'r', 'alpha': '2 * r'}
+    final_calls = [node.value.func.id for node in tree.body
+                   if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)]
+    assert final_calls == ['make_figures', 'plot_losses', 'save_to_drive', 'bundle_outputs']
 
 
 def assert_signatures_match_lab10(names):

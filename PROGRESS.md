@@ -34,3 +34,10 @@
 - Replaced the existing E4 runner call with the shared training/evaluation functions to satisfy the no-runner check.
 - Regenerated the notebook and added offline signature, training, scoring, and resume tests.
 - Validation: python -m pytest -q passed with 93 passed and 1 skipped.
+
+## Task 6: Section 8 E4 ablation, final cells, and the global consistency test
+- Updated section 8 to run E4 LoRA ranks 4 and 64 with alpha equal to twice the rank, using the best setup and existing evidence resume guards.
+- Added final Drive saving before output bundling and a local extraction comment; E5 remains unimplemented.
+- Added offline tests for placeholders, valid lab10 imports and attributes, notebook-defined core functions, known calls, and E4 execution structure.
+- Regenerated lab_day10.ipynb and verified the generator consistency check.
+- Ran python -m pytest -q: 97 passed, 1 skipped.
