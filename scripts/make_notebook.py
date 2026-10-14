@@ -437,13 +437,21 @@ def apply_setup(model, setup, r=16, alpha=32, dropout=0.05):
     collate = make_collate(processor)
     processor.tokenizer.padding_side = "right"
 
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+    model.train()
+    # GradScaler chỉ unscale được gradient fp32: ép mọi tham số đang học về fp32 SAU khi bật
+    # gradient checkpointing và TRƯỚC khi tạo optimizer (E2/E3: projector nạp ở fp16)
+    fp16 = [n for n, p in model.named_parameters() if p.requires_grad and p.dtype != torch.float32]
+    if fp16:
+        print(f"ép {len(fp16)} tensor đang học về fp32, ví dụ: {fp16[:3]}")
+    for p in model.parameters():
+        if p.requires_grad and p.dtype != torch.float32:
+            p.data = p.data.float()
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
     sched = get_cosine_schedule_with_warmup(opt, int(0.05 * max_steps), max_steps)
     scaler = torch.amp.GradScaler("cuda")
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    model.config.use_cache = False
-    model.train()
     torch.cuda.reset_peak_memory_stats()
 
     rng = random.Random(seed)
@@ -465,7 +473,16 @@ def apply_setup(model, setup, r=16, alpha=32, dropout=0.05):
                 raise RuntimeError(f"loss không hữu hạn ở bước {step}: {loss.item()} (tràn fp16?)")
             scaler.scale(loss).backward()
             total += loss.item()
-        scaler.unscale_(opt)
+        try:
+            scaler.unscale_(opt)
+        except ValueError:                 # còn gradient fp16: đưa cả tham số lẫn gradient về fp32
+            for p in params:
+                if p.grad is not None and p.grad.dtype != torch.float32:
+                    g = p.grad.float()
+                    p.grad = None
+                    p.data = p.data.float()
+                    p.grad = g
+            scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         scaler.step(opt)
         scaler.update()
